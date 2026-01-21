@@ -1,0 +1,210 @@
+apply plugin: 'java-library'
+jar.archiveBaseName = "ssh-extension"
+
+group 'app.krista.extensions.it.cli'
+version '2.0.1'
+
+if (rootProject.file('buildnr.txt').canRead()) {
+    ext.buildnr = rootProject.file('buildnr.txt').text.trim()
+} else {
+    ext.buildnr = "0";
+}
+
+def computedVersion = "local"
+def computedBaseName = "SSHExtension"
+
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+
+            println "✓ Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("⚠ release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+
+task updateVersion {
+    doFirst {
+        project.ext.newbuildnr = Integer.parseInt(project.ext.buildnr) + 1
+        print "Building extension version: " + version as String + "-" + project.ext.newbuildnr
+        rootProject.file('buildnr.txt').text = project.ext.newbuildnr
+        System.clearProperty("extensionVersion")
+        System.setProperty("extensionVersion", version as String + "-" + project.ext.newbuildnr)
+    }
+}
+compileJava.dependsOn clean
+compileJava.dependsOn updateVersion
+
+System.setProperty("extensionVersion", version.toString())
+
+sourceCompatibility = '11'
+targetCompatibility = '11'
+
+repositories {
+    maven {
+        url "https://packages.cicd.in.antbrains.com/artifactory/libs-release"
+    }
+    mavenCentral()
+    mavenLocal()
+}
+
+configurations {
+    implementation {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+dependencies {
+    annotationProcessor 'app.krista:extension-impl-anno-processors:1.0.115' // used to generate the extension.json
+    compileOnly 'app.krista:krista-apis:1.0.115' // defines the Krista Service APIs
+    compileOnly 'org.glassfish.hk2:hk2-api:3.0.3' // used to define scope of objects
+    implementation 'org.glassfish.jersey.media:jersey-media-multipart:2.35'
+
+    implementation 'com.jcraft:jsch:0.1.55'
+}
+
+task createSourceDir(type: Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+
+task copyGradleFile(type: Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+
+task includeSources(type: Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+import java.util.regex.Pattern
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties file with extension version and domain information'
+
+    doLast {
+        def extensionFilePath = 'src/main/java/app/krista/extensions/it/cli/ssh/SSHExtension.java'
+        def areaFilePath = 'src/main/java/app/krista/extensions/it/cli/ssh/catalog/SessionArea.java'
+        def extensionFile = project.file(extensionFilePath)
+        def areaFile = project.file(areaFilePath)
+
+        if (!extensionFile.exists()) {
+            throw new GradleException("Extension file not found: ${extensionFilePath}")
+        }
+
+        if (!areaFile.exists()) {
+            throw new GradleException("Area file not found: ${areaFilePath}")
+        }
+
+        def properties = new Properties()
+        // Pre-compile the regex pattern for better performance
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        // Extract Extension annotation information
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") {
+                properties.setProperty("extension.version", value)
+                logger.lifecycle("Found extension version: ${value}")
+            } else if (key == "name") {
+                properties.setProperty("extension.name", value)
+                logger.lifecycle("Found extension name: ${value}")
+            }
+        }
+
+        // Extract Domain annotation information from the area file
+        extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") {
+                properties.setProperty("domain.name", value)
+                logger.lifecycle("Found domain name: ${value}")
+            } else if (key == "ecosystemName") {
+                properties.setProperty("ecosystem.name", value)
+                logger.lifecycle("Found ecosystem name: ${value}")
+            }
+        }
+
+        // Set default values if not found in annotations
+        if (!properties.getProperty('extension.name')) {
+            properties.setProperty("extension.name", "SSH Extension")
+            logger.lifecycle("Set default extension name: SSH Extension")
+        }
+
+        if (!properties.getProperty('extension.version')) {
+            throw new GradleException("Could not find extension version in ${extensionFilePath}")
+        }
+
+        if (!properties.getProperty('domain.name')) {
+            properties.setProperty("domain.name", "Spreadsheets")
+            logger.lifecycle("Set default domain name: Spreadsheets")
+        }
+
+        if (!properties.getProperty('ecosystem.name')) {
+            properties.setProperty("ecosystem.name", "Essentials")
+            logger.lifecycle("Set default ecosystem name: Essentials")
+        }
+
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties with content:\n${content}")
+    }
+}
+
+// Helper method to extract annotation information
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) {
+            inAnnotation = true
+            annotationText.setLength(0) // Reset the buffer when starting a new annotation
+            annotationText.append(line)
+        } else if (inAnnotation) {
+            annotationText.append(line)
+        }
+
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) {
+                def key = matcher.group(1)
+                def value = matcher.group(2)
+                processProperty.call(key, value)
+            }
+        }
+    }
+}
+
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+}
+
+jar {
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn includeSources
+
+    archiveBaseName = project.ext.has("finalBaseName") ? project.ext.finalBaseName : "SSHExtension"
+
+    from {
+        configurations.implementation.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
